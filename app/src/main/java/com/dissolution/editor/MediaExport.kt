@@ -63,7 +63,7 @@ object MediaExport {
         targetFrameRate: Int,
         targetBitrate: Int,
         onFinished: (Result<File>) -> Unit,
-    ) {
+    ): Transformer {
         require(source.isFile) { "Source video is missing" }
         require(startMs >= 0 && endMs > startMs) { "Choose a valid trim range" }
         require(targetBitrate in 1_000_000..150_000_000) { "Bitrate must be between 1 and 150 Mbps" }
@@ -125,5 +125,6 @@ object MediaExport {
                 .build(),
             output.absolutePath,
         )
+        return transformer
     }
 }

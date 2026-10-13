@@ -11,19 +11,29 @@ import androidx.activity.ComponentActivity
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -33,6 +43,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
@@ -43,6 +54,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RangeSlider
@@ -52,6 +64,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -74,9 +87,12 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.transformer.Transformer
 import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
 import kotlin.math.roundToInt
@@ -87,6 +103,26 @@ private val Line = Color(0xFF35403A)
 private val Paper = Color(0xFFEAE9DD)
 private val Muted = Color(0xFF9BA59D)
 private val Acid = Color(0xFFC3F36B)
+
+@Composable
+private fun ResponsivePanes(
+    modifier: Modifier = Modifier,
+    wide: Boolean,
+    editor: @Composable ColumnScope.() -> Unit,
+    assistant: @Composable ColumnScope.() -> Unit,
+) {
+    if (wide) {
+        Row(modifier, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+            Column(Modifier.weight(1.45f).fillMaxHeight(), content = editor)
+            Column(Modifier.weight(1f).fillMaxHeight(), content = assistant)
+        }
+    } else {
+        Column(modifier, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Column(Modifier.weight(1.35f).fillMaxWidth().verticalScroll(rememberScrollState()), content = editor)
+            Column(Modifier.weight(1f).fillMaxWidth(), content = assistant)
+        }
+    }
+}
 
 class MainActivity : ComponentActivity() {
     private var onVideoPicked: (Uri) -> Unit = {}
@@ -137,6 +173,7 @@ class MainActivity : ComponentActivity() {
         var prompt by remember { mutableStateOf("") }
         var busy by remember { mutableStateOf(false) }
         var exportState by remember { mutableStateOf("READY") }
+        var activeTransformer by remember { mutableStateOf<Transformer?>(null) }
         val scope = rememberCoroutineScope()
         var aiSettings by remember { mutableStateOf(AiSettingsStore.load(context)) }
         var showAiSettings by remember { mutableStateOf(false) }
@@ -149,12 +186,29 @@ class MainActivity : ComponentActivity() {
         val requestedBitrate = bitrateMbps * 1_000_000
         val outputWidth = outputSize?.first ?: videoInfo?.width ?: 0
         val outputHeight = outputSize?.second ?: videoInfo?.height ?: 0
-        val canExportProfile = remember(videoInfo, outputWidth, outputHeight, exportFrameRate, requestedBitrate, outputMimeType) {
-            val info = videoInfo
-            info != null && exportFrameRate <= info.frameRate && VideoCapabilities.supports(
-                outputMimeType, outputWidth, outputHeight, exportFrameRate, requestedBitrate,
-            )
+        val probeConfig = videoInfo?.let {
+            EncoderProbeConfig(outputMimeType, outputWidth, outputHeight, it.frameRate, requestedBitrate)
         }
+        var supportedFrameRates by remember { mutableStateOf(emptySet<Int>()) }
+        var checkedProbeConfig by remember { mutableStateOf<EncoderProbeConfig?>(null) }
+        LaunchedEffect(videoInfo, outputWidth, outputHeight, requestedBitrate, outputMimeType) {
+            checkedProbeConfig = null
+            delay(180)
+            val info = videoInfo
+            supportedFrameRates = if (info == null) {
+                emptySet()
+            } else {
+                withContext(Dispatchers.Default) {
+                    listOf(30, 60, 120).filter { rate ->
+                        rate <= info.frameRate && VideoCapabilities.supports(
+                            outputMimeType, outputWidth, outputHeight, rate, requestedBitrate,
+                        )
+                    }.toSet()
+                }
+            }
+            checkedProbeConfig = probeConfig
+        }
+        val canExportProfile = probeConfig != null && probeConfig == checkedProbeConfig && exportFrameRate in supportedFrameRates
 
         onVideoPicked = { uri ->
             importing = true
@@ -196,11 +250,23 @@ class MainActivity : ComponentActivity() {
                 ActionButton("FADCam", Icons.Default.VideoCameraBack, openFadCam, Modifier.weight(1f), secondary = true)
             }
             Spacer(Modifier.height(14.dp))
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                Column(Modifier.weight(1.35f).fillMaxWidth()) {
+            BoxWithConstraints(Modifier.weight(1f)) {
+                ResponsivePanes(
+                    modifier = Modifier.fillMaxSize(),
+                    wide = maxWidth >= 840.dp,
+                    editor = {
                     Text("01 / PREVIEW", color = Muted, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
                     Spacer(Modifier.height(8.dp))
-                    VideoPreview(pickedVideo, importing, Modifier.weight(1f))
+                    VideoPreview(
+                        pickedVideo,
+                        importing,
+                        Modifier.fillMaxWidth()
+                            .heightIn(max = 280.dp)
+                            .aspectRatio(
+                                videoInfo?.let { it.width.toFloat() / it.height } ?: (16f / 9f),
+                                matchHeightConstraintsFirst = true,
+                            ),
+                    )
                     Spacer(Modifier.height(10.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Default.Movie, contentDescription = null, tint = Acid, modifier = Modifier.size(16.dp))
@@ -222,7 +288,7 @@ class MainActivity : ComponentActivity() {
                             FilterChip(
                                 selected = resolution == value,
                                 onClick = { resolution = value },
-                                enabled = videoInfo != null,
+                                enabled = videoInfo?.let { profileAvailable(it, value) } ?: false,
                                 label = { Text(label, fontSize = 10.sp) },
                             )
                         }
@@ -234,14 +300,15 @@ class MainActivity : ComponentActivity() {
                         )
                     }
                     Row(horizontalArrangement = Arrangement.spacedBy(5.dp), verticalAlignment = Alignment.CenterVertically) {
-                        listOf(30, 60, 120).forEach { rate ->
-                            val supported = videoInfo?.let { info ->
-                                rate <= info.frameRate && VideoCapabilities.supports(outputMimeType, outputWidth, outputHeight, rate, requestedBitrate)
-                            } ?: false
+                        (listOfNotNull(videoInfo?.frameRate) + listOf(30, 60, 120))
+                            .distinct()
+                            .filter { rate -> rate <= (videoInfo?.frameRate ?: 0) }
+                            .sorted()
+                            .forEach { rate ->
                             FilterChip(
                                 selected = exportFrameRate == rate,
                                 onClick = { exportFrameRate = rate },
-                                enabled = supported,
+                                enabled = rate in supportedFrameRates,
                                 label = { Text("${rate}fps", fontSize = 10.sp) },
                             )
                         }
@@ -268,7 +335,7 @@ class MainActivity : ComponentActivity() {
                         } else {
                             busy = true
                             exportState = "ENCODING"
-                            MediaExport.export(
+                            activeTransformer = MediaExport.export(
                                 context = context,
                                 source = source,
                                 startMs = trimRange.start.toLong(),
@@ -291,14 +358,31 @@ class MainActivity : ComponentActivity() {
                                         onFailure = { it.message ?: "Video export failed" },
                                     )
                                     busy = false
+                                    activeTransformer = null
                                     exportState = if (result.isSuccess && message.startsWith("Saved")) "EXPORTED" else "EXPORT FAILED"
                                     Toast.makeText(context, message, Toast.LENGTH_LONG).show()
                                 }
                             }
                         }
                     }, Modifier.fillMaxWidth(), secondary = true, enabled = !busy && canExportProfile)
-                }
-                Column(Modifier.weight(1f).fillMaxWidth()) {
+                    AnimatedVisibility(visible = activeTransformer != null) {
+                        Row(
+                            Modifier.fillMaxWidth().animateContentSize(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            LinearProgressIndicator(Modifier.weight(1f), color = Acid)
+                            Text("RENDERING", color = Muted, fontSize = 9.sp, fontFamily = FontFamily.Monospace)
+                            IconButton(onClick = {
+                                activeTransformer?.cancel()
+                                exportState = "CANCELLING"
+                            }) {
+                                Icon(Icons.Default.Close, contentDescription = "Cancel export", tint = Paper)
+                            }
+                        }
+                    }
+                    },
+                    assistant = {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Default.AutoAwesome, contentDescription = null, tint = Acid, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(7.dp))
@@ -315,7 +399,20 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                         items(messages) { (user, text) ->
-                            Text(if (user) "YOU  /  $text" else "BOSS AI  /  $text", color = if (user) Paper else Acid, fontSize = 12.sp, lineHeight = 18.sp)
+                            Row(
+                                Modifier.fillMaxWidth(),
+                                horizontalArrangement = if (user) Arrangement.End else Arrangement.Start,
+                            ) {
+                                Column(
+                                    Modifier.widthIn(max = 320.dp)
+                                        .background(if (user) Color(0xFF303B33) else Color(0xFF222A25), RoundedCornerShape(8.dp))
+                                        .padding(horizontal = 11.dp, vertical = 8.dp),
+                                ) {
+                                    Text(if (user) "YOU" else "BOSS AI", color = if (user) Muted else Acid, fontSize = 9.sp, fontFamily = FontFamily.Monospace)
+                                    Spacer(Modifier.height(3.dp))
+                                    Text(text, color = Paper, fontSize = 12.sp, lineHeight = 18.sp)
+                                }
+                            }
                         }
                     }
                     Spacer(Modifier.height(8.dp))
@@ -391,13 +488,16 @@ class MainActivity : ComponentActivity() {
                                                 val requestedHevc = args.optString("codec", if (useHevc) "hevc" else "h264") == "hevc"
                                                 val size = outputSize(info, requestedResolution)
                                                 require(requestedFrameRate <= info.frameRate) { "Requested FPS exceeds the source FPS" }
-                                                require(VideoCapabilities.supports(
-                                                    VideoCapabilities.mimeType(requestedHevc),
-                                                    size?.first ?: info.width,
-                                                    size?.second ?: info.height,
-                                                    requestedFrameRate,
-                                                    requestedBitrate,
-                                                )) { "This device does not support that resolution, FPS, codec, and bitrate combination" }
+                                                val supported = withContext(Dispatchers.Default) {
+                                                    VideoCapabilities.supports(
+                                                        VideoCapabilities.mimeType(requestedHevc),
+                                                        size?.first ?: info.width,
+                                                        size?.second ?: info.height,
+                                                        requestedFrameRate,
+                                                        requestedBitrate,
+                                                    )
+                                                }
+                                                require(supported) { "This device does not support that resolution, FPS, codec, and bitrate combination" }
                                                 resolution = requestedResolution
                                                 exportFrameRate = requestedFrameRate
                                                 bitrateMbps = requestedBitrate / 1_000_000
@@ -420,7 +520,8 @@ class MainActivity : ComponentActivity() {
                             Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send prompt", modifier = Modifier.size(17.dp))
                         }
                     }
-                }
+                    },
+                )
             }
             Spacer(Modifier.height(8.dp))
             Text("AI DOWNLOADS REQUIRE YOUR CONFIRMATION IN SEAL  ·  IMPORTED CLIPS STAY ON DEVICE", color = Muted, fontSize = 9.sp, fontFamily = FontFamily.Monospace)
@@ -491,10 +592,18 @@ class MainActivity : ComponentActivity() {
         }
         val sourceLongEdge = maxOf(video.width, video.height)
         val sourceShortEdge = minOf(video.width, video.height)
-        val requestedShortEdge = (requestedLongEdge.toDouble() * sourceShortEdge / sourceLongEdge)
+        val outputLongEdge = minOf(requestedLongEdge, sourceLongEdge)
+        val requestedShortEdge = (outputLongEdge.toDouble() * sourceShortEdge / sourceLongEdge)
             .roundToInt().coerceAtLeast(2) / 2 * 2
-        return if (video.width >= video.height) requestedLongEdge to requestedShortEdge
-        else requestedShortEdge to requestedLongEdge
+        return if (video.width >= video.height) outputLongEdge to requestedShortEdge
+        else requestedShortEdge to outputLongEdge
+    }
+
+    private fun profileAvailable(info: VideoInfo, profile: String): Boolean = when (profile) {
+        "source" -> true
+        "1080p" -> maxOf(info.width, info.height) >= 1920
+        "4k" -> maxOf(info.width, info.height) >= 3840
+        else -> false
     }
 
     @Composable

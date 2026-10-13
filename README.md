@@ -4,7 +4,8 @@ An Android video-editing prototype that brings together clip capture/import, an 
 
 ## Included
 
-- A Jetpack Compose clip workspace with video preview, import, trim, and Media3 hardware-accelerated export.
+- An adaptive Jetpack Compose editor: stacked and scrollable on phones, side-by-side on tablets and landscape screens, with source-aspect preview and direct trim controls.
+- Media3 hardware-accelerated H.264/HEVC export with a render indicator, cancellation, and a device-checked resolution/FPS/bitrate profile saved to Movies.
 - A Retrofit chat client with an OpenAI-compatible BossAI endpoint configuration. Configure its HTTPS base URL, model, and API key in the app's settings; the key is encrypted with Android Keystore.
 - AI `download_video` tool calls are handed to Seal's exported quick-download activity. Seal opens its own download/format confirmation screen; it does not silently download in the background.
 - AI trim and export-profile tool calls apply to the current edit. The app checks the source clip and Android hardware encoder before enabling a profile.

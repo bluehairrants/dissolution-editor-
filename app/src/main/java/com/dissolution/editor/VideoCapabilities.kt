@@ -6,6 +6,15 @@ import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import androidx.media3.common.MimeTypes
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
+
+private data class EncoderProfile(
+    val mimeType: String,
+    val width: Int,
+    val height: Int,
+    val frameRate: Int,
+    val bitrate: Int,
+)
 
 data class VideoInfo(
     val durationMs: Long,
@@ -14,7 +23,17 @@ data class VideoInfo(
     val frameRate: Int,
 )
 
+data class EncoderProbeConfig(
+    val mimeType: String,
+    val width: Int,
+    val height: Int,
+    val sourceFrameRate: Int,
+    val bitrate: Int,
+)
+
 object VideoCapabilities {
+    private val encoderProfiles = ConcurrentHashMap<EncoderProfile, Boolean>()
+
     fun inspect(file: File): VideoInfo {
         val retriever = MediaMetadataRetriever()
         try {
@@ -51,17 +70,19 @@ object VideoCapabilities {
         height: Int,
         frameRate: Int,
         bitrate: Int,
-    ): Boolean = runCatching {
-        MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.any { codec ->
-            codec.isEncoder && codec.supportedTypes.any { it.equals(mimeType, ignoreCase = true) } &&
-                runCatching {
-                    val capabilities = codec.getCapabilitiesForType(mimeType)
-                    val video = capabilities.videoCapabilities
-                    video.areSizeAndRateSupported(width, height, frameRate.toDouble()) &&
-                        video.bitrateRange.contains(bitrate)
-                }.getOrDefault(false)
-        }
-    }.getOrDefault(false)
+    ): Boolean = encoderProfiles.computeIfAbsent(EncoderProfile(mimeType, width, height, frameRate, bitrate)) {
+        runCatching {
+            MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.any { codec ->
+                codec.isEncoder && codec.supportedTypes.any { it.equals(mimeType, ignoreCase = true) } &&
+                    runCatching {
+                        val capabilities = codec.getCapabilitiesForType(mimeType)
+                        val video = capabilities.videoCapabilities
+                        video.areSizeAndRateSupported(width, height, frameRate.toDouble()) &&
+                            video.bitrateRange.contains(bitrate)
+                    }.getOrDefault(false)
+            }
+        }.getOrDefault(false)
+    }
 
     fun mimeType(isHevc: Boolean): String = if (isHevc) MimeTypes.VIDEO_H265 else MimeTypes.VIDEO_H264
 }
