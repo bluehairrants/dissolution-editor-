@@ -87,4 +87,39 @@ object BossAiApi {
             ),
         ),
     )
+
+    fun editorTools() = listOf(
+        downloadTool(),
+        ChatTool(
+            function = ToolFunction(
+                name = "set_trim",
+                description = "Set the selected clip's trim range using seconds from the start of the source video.",
+                parameters = mapOf(
+                    "type" to "object",
+                    "properties" to mapOf(
+                        "start_seconds" to mapOf("type" to "number"),
+                        "end_seconds" to mapOf("type" to "number"),
+                    ),
+                    "required" to listOf("start_seconds", "end_seconds"),
+                    "additionalProperties" to false,
+                ),
+            ),
+        ),
+        ChatTool(
+            function = ToolFunction(
+                name = "set_export_profile",
+                description = "Choose output size, frame rate, codec, and bitrate. Frame rate may not exceed the source, and hardware capability is checked.",
+                parameters = mapOf(
+                    "type" to "object",
+                    "properties" to mapOf(
+                        "height" to mapOf("type" to "integer", "enum" to listOf(1080, 2160)),
+                        "frame_rate" to mapOf("type" to "integer", "enum" to listOf(30, 60, 120)),
+                        "bitrate_mbps" to mapOf("type" to "integer", "minimum" to 1, "maximum" to 150),
+                        "codec" to mapOf("type" to "string", "enum" to listOf("h264", "hevc")),
+                    ),
+                    "additionalProperties" to false,
+                ),
+            ),
+        ),
+    )
 }

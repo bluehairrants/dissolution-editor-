@@ -1,8 +1,11 @@
 package com.dissolution.editor
 
+import android.content.ContentValues
 import android.content.Intent
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Bundle
+import android.provider.MediaStore
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.result.ActivityResultLauncher
@@ -25,23 +28,34 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.VideoCameraBack
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RangeSlider
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -52,6 +66,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -59,12 +75,11 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
-import com.arthenica.ffmpegkit.FFmpegKit
-import com.arthenica.ffmpegkit.ReturnCode
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.io.File
+import kotlin.math.roundToInt
 
 private val Ink = Color(0xFF101312)
 private val Panel = Color(0xFF1A201D)
@@ -108,22 +123,52 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun DissolutionApp(importVideo: () -> Unit, openFadCam: () -> Unit) {
+        val context = LocalContext.current
         var pickedVideo by remember { mutableStateOf<File?>(null) }
+        var videoInfo by remember { mutableStateOf<VideoInfo?>(null) }
+        var sourceDurationMs by remember { mutableLongStateOf(0L) }
         var importing by remember { mutableStateOf(false) }
+        var trimRange by remember { mutableStateOf(0f..0f) }
+        var resolution by remember { mutableStateOf("source") }
+        var exportFrameRate by remember { mutableIntStateOf(30) }
+        var bitrateMbps by remember { mutableIntStateOf(25) }
+        var useHevc by remember { mutableStateOf(false) }
         val messages = remember { mutableStateListOf<Pair<Boolean, String>>() }
         var prompt by remember { mutableStateOf("") }
         var busy by remember { mutableStateOf(false) }
         var exportState by remember { mutableStateOf("READY") }
         val scope = rememberCoroutineScope()
-        val context = LocalContext.current
+        var aiSettings by remember { mutableStateOf(AiSettingsStore.load(context)) }
+        var showAiSettings by remember { mutableStateOf(false) }
+        var endpointInput by remember { mutableStateOf(aiSettings.baseUrl) }
+        var modelInput by remember { mutableStateOf(aiSettings.model) }
+        var apiKeyInput by remember { mutableStateOf(aiSettings.apiKey) }
+
+        val outputSize = outputSize(videoInfo, resolution)
+        val outputMimeType = VideoCapabilities.mimeType(useHevc)
+        val requestedBitrate = bitrateMbps * 1_000_000
+        val outputWidth = outputSize?.first ?: videoInfo?.width ?: 0
+        val outputHeight = outputSize?.second ?: videoInfo?.height ?: 0
+        val canExportProfile = remember(videoInfo, outputWidth, outputHeight, exportFrameRate, requestedBitrate, outputMimeType) {
+            val info = videoInfo
+            info != null && exportFrameRate <= info.frameRate && VideoCapabilities.supports(
+                outputMimeType, outputWidth, outputHeight, exportFrameRate, requestedBitrate,
+            )
+        }
 
         onVideoPicked = { uri ->
             importing = true
             scope.launch(Dispatchers.IO) {
                 val copy = File(cacheDir, "source_${System.currentTimeMillis()}.mp4")
                 contentResolver.openInputStream(uri)?.use { input -> copy.outputStream().use(input::copyTo) }
+                val info = runCatching { VideoCapabilities.inspect(copy) }.getOrNull()
                 launch(Dispatchers.Main) {
                     pickedVideo = copy
+                    videoInfo = info
+                    sourceDurationMs = info?.durationMs ?: 0L
+                    trimRange = 0f..(info?.durationMs?.toFloat() ?: 0f)
+                    exportFrameRate = minOf(info?.frameRate ?: 30, 30)
+                    resolution = "source"
                     importing = false
                 }
             }
@@ -134,6 +179,14 @@ class MainActivity : ComponentActivity() {
                 Column(Modifier.weight(1f)) {
                     Text("DISSOLUTION", color = Paper, fontSize = 20.sp, fontWeight = FontWeight.Black, fontFamily = FontFamily.Monospace)
                     Text("AI VIDEO WORKSPACE  /  01", color = Muted, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                }
+                IconButton(onClick = {
+                    endpointInput = aiSettings.baseUrl
+                    modelInput = aiSettings.model
+                    apiKeyInput = aiSettings.apiKey
+                    showAiSettings = true
+                }) {
+                    Icon(Icons.Default.Settings, contentDescription = "BossAI settings", tint = Paper)
                 }
                 Text("LOCAL PROJECT", color = Acid, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
             }
@@ -153,31 +206,97 @@ class MainActivity : ComponentActivity() {
                         Icon(Icons.Default.Movie, contentDescription = null, tint = Acid, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(7.dp))
                         Text(pickedVideo?.name ?: "No clip loaded", color = Paper, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-                        Text(exportState, color = Acid, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                        Text(videoInfo?.let { "${it.width}x${it.height} ${it.frameRate}fps" } ?: exportState, color = Acid, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
                     }
                     Spacer(Modifier.height(10.dp))
-                    TimelineStrip(hasClip = pickedVideo != null)
+                    TimelineStrip(
+                        durationMs = sourceDurationMs,
+                        trimRange = trimRange,
+                        enabled = videoInfo != null,
+                        onTrimChange = { trimRange = it },
+                    )
                     Spacer(Modifier.height(10.dp))
-                    ActionButton("EXPORT H.264", Icons.Default.PlayArrow, {
+                    Text("OUTPUT PROFILE", color = Muted, fontSize = 9.sp, fontFamily = FontFamily.Monospace)
+                    Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                        listOf("source" to "SOURCE", "1080p" to "1080P", "4k" to "4K").forEach { (value, label) ->
+                            FilterChip(
+                                selected = resolution == value,
+                                onClick = { resolution = value },
+                                enabled = videoInfo != null,
+                                label = { Text(label, fontSize = 10.sp) },
+                            )
+                        }
+                        FilterChip(
+                            selected = useHevc,
+                            onClick = { useHevc = !useHevc },
+                            enabled = videoInfo != null,
+                            label = { Text(if (useHevc) "HEVC" else "H.264", fontSize = 10.sp) },
+                        )
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(5.dp), verticalAlignment = Alignment.CenterVertically) {
+                        listOf(30, 60, 120).forEach { rate ->
+                            val supported = videoInfo?.let { info ->
+                                rate <= info.frameRate && VideoCapabilities.supports(outputMimeType, outputWidth, outputHeight, rate, requestedBitrate)
+                            } ?: false
+                            FilterChip(
+                                selected = exportFrameRate == rate,
+                                onClick = { exportFrameRate = rate },
+                                enabled = supported,
+                                label = { Text("${rate}fps", fontSize = 10.sp) },
+                            )
+                        }
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("${bitrateMbps} Mbps", color = Paper, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                        Slider(
+                            value = bitrateMbps.toFloat(),
+                            onValueChange = { bitrateMbps = it.roundToInt().coerceIn(1, 150) },
+                            valueRange = 1f..150f,
+                            steps = 148,
+                            enabled = videoInfo != null,
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                    ActionButton("EXPORT ${if (useHevc) "HEVC" else "H.264"}", Icons.Default.PlayArrow, {
                         val source = pickedVideo
                         if (source == null) {
                             exportState = "IMPORT A CLIP"
+                        } else if (sourceDurationMs <= 0L) {
+                            exportState = "INVALID SOURCE"
+                        } else if (!canExportProfile) {
+                            exportState = "PROFILE UNSUPPORTED"
                         } else {
                             busy = true
                             exportState = "ENCODING"
-                            scope.launch(Dispatchers.IO) {
-                                val outputDir = File(getExternalFilesDir("Movies"), "exports").apply { mkdirs() }
-                                val output = File(outputDir, "dissolution_${System.currentTimeMillis()}.mp4")
-                                val command = "-y -i ${source.absolutePath} -c:v libx264 -preset ultrafast -c:a aac ${output.absolutePath}"
-                                val session = FFmpegKit.execute(command)
-                                launch(Dispatchers.Main) {
+                            MediaExport.export(
+                                context = context,
+                                source = source,
+                                startMs = trimRange.start.toLong(),
+                                endMs = trimRange.endInclusive.toLong(),
+                                outputSize = outputSize,
+                                videoMimeType = outputMimeType,
+                                sourceFrameRate = videoInfo?.frameRate ?: 30,
+                                targetFrameRate = exportFrameRate,
+                                targetBitrate = requestedBitrate,
+                            ) { result ->
+                                scope.launch {
+                                    val message = result.fold(
+                                        onSuccess = { exported ->
+                                            runCatching { MediaExport.publishToMovies(context, exported) }
+                                                .fold(
+                                                    onSuccess = { "Saved to Movies/Dissolution Editor" },
+                                                    onFailure = { it.message ?: "Could not publish video to Movies" },
+                                                )
+                                        },
+                                        onFailure = { it.message ?: "Video export failed" },
+                                    )
                                     busy = false
-                                    exportState = if (ReturnCode.isSuccess(session.returnCode)) "EXPORTED" else "EXPORT FAILED"
-                                    Toast.makeText(context, if (ReturnCode.isSuccess(session.returnCode)) "Saved to ${output.name}" else "FFmpeg export failed", Toast.LENGTH_LONG).show()
+                                    exportState = if (result.isSuccess && message.startsWith("Saved")) "EXPORTED" else "EXPORT FAILED"
+                                    Toast.makeText(context, message, Toast.LENGTH_LONG).show()
                                 }
                             }
                         }
-                    }, Modifier.fillMaxWidth(), secondary = true, enabled = !busy)
+                    }, Modifier.fillMaxWidth(), secondary = true, enabled = !busy && canExportProfile)
                 }
                 Column(Modifier.weight(1f).fillMaxWidth()) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -223,23 +342,74 @@ class MainActivity : ComponentActivity() {
                                 busy = true
                                 scope.launch {
                                     val history = buildList {
-                                        add(ChatMessage("system", "You are BossAI, a practical video editing assistant. Use download_video only when the user asks to download a video from a public web URL. Never claim a download succeeded; Seal will ask the user to review and confirm it."))
+                                        add(ChatMessage("system", "You are BossAI, a practical video editing assistant. Use set_trim to update the selected clip trim, set_export_profile to select a device-supported export profile, and download_video only when the user asks to download a public web video. Seal asks the user to confirm every download."))
                                         addAll(messages.map { (fromUser, content) -> ChatMessage(if (fromUser) "user" else "assistant", content) })
                                     }
-                                    val reply = runCatching { askBossAi(history) }
-                                    val result = reply.getOrElse { "BossAI is not configured or the request failed: ${it.message ?: "unknown error"}" }
-                                    val url = result.substringAfter("SEAL_URL:", "").trim().takeIf(String::isNotEmpty)
-                                    if (url != null) {
-                                        val handoff = Intent(Intent.ACTION_SEND).apply {
-                                            type = "text/plain"
-                                            setPackage("com.junkfood.seal")
-                                            putExtra(Intent.EXTRA_TEXT, url)
+                                    val reply = runCatching { askBossAi(aiSettings, history) }
+                                    val assistant = reply.getOrNull()
+                                    val function = assistant?.toolCalls?.firstOrNull()?.function
+                                    when (function?.name) {
+                                        "download_video" -> {
+                                            val url = runCatching { JSONObject(function.arguments).getString("url") }.getOrNull()
+                                            val parsedUrl = url?.let(Uri::parse)
+                                            if (parsedUrl == null || parsedUrl.scheme !in setOf("http", "https") || parsedUrl.host.isNullOrBlank()) {
+                                                messages.add(false to "BossAI returned an invalid video URL.")
+                                            } else {
+                                                val handoff = Intent(Intent.ACTION_SEND).apply {
+                                                    type = "text/plain"
+                                                    setPackage("com.junkfood.seal")
+                                                    putExtra(Intent.EXTRA_TEXT, url)
+                                                }
+                                                runCatching { context.startActivity(handoff) }
+                                                    .onSuccess { messages.add(false to "Opened Seal for your download review.") }
+                                                    .onFailure { messages.add(false to "Could not open Seal. Install Seal and try again.") }
+                                            }
                                         }
-                                        runCatching { context.startActivity(handoff) }
-                                            .onSuccess { messages.add(false to "Opened Seal for your download review.") }
-                                            .onFailure { messages.add(false to "Could not open Seal. Install Seal and try again.") }
-                                    } else {
-                                        messages.add(false to result)
+                                        "set_trim" -> {
+                                            runCatching {
+                                                val args = JSONObject(function.arguments)
+                                                val durationSeconds = sourceDurationMs / 1000.0
+                                                val startSeconds = args.getDouble("start_seconds").coerceIn(0.0, durationSeconds)
+                                                val endSeconds = args.getDouble("end_seconds").coerceIn(0.0, durationSeconds)
+                                                require(endSeconds > startSeconds) { "Trim end must be after trim start" }
+                                                trimRange = (startSeconds * 1000).toFloat()..(endSeconds * 1000).toFloat()
+                                            }.onSuccess { messages.add(false to "Trim range updated on the timeline.") }
+                                                .onFailure { messages.add(false to "Could not set trim: ${it.message}") }
+                                        }
+                                        "set_export_profile" -> {
+                                            runCatching {
+                                                val args = JSONObject(function.arguments)
+                                                val info = requireNotNull(videoInfo) { "Import a clip first" }
+                                                val height = args.optInt("height", 0)
+                                                val requestedResolution = when (height) {
+                                                    1080 -> "1080p"
+                                                    2160 -> "4k"
+                                                    else -> "source"
+                                                }
+                                                val requestedFrameRate = args.optInt("frame_rate", exportFrameRate)
+                                                val requestedBitrate = args.optInt("bitrate_mbps", bitrateMbps).coerceIn(1, 150) * 1_000_000
+                                                val requestedHevc = args.optString("codec", if (useHevc) "hevc" else "h264") == "hevc"
+                                                val size = outputSize(info, requestedResolution)
+                                                require(requestedFrameRate <= info.frameRate) { "Requested FPS exceeds the source FPS" }
+                                                require(VideoCapabilities.supports(
+                                                    VideoCapabilities.mimeType(requestedHevc),
+                                                    size?.first ?: info.width,
+                                                    size?.second ?: info.height,
+                                                    requestedFrameRate,
+                                                    requestedBitrate,
+                                                )) { "This device does not support that resolution, FPS, codec, and bitrate combination" }
+                                                resolution = requestedResolution
+                                                exportFrameRate = requestedFrameRate
+                                                bitrateMbps = requestedBitrate / 1_000_000
+                                                useHevc = requestedHevc
+                                            }.onSuccess { messages.add(false to "Export profile applied. Review it before exporting.") }
+                                                .onFailure { messages.add(false to "Profile not applied: ${it.message}") }
+                                        }
+                                        else -> messages.add(
+                                            false to (assistant?.content
+                                                ?: reply.exceptionOrNull()?.message?.let { "BossAI request failed: $it" }
+                                                ?: "BossAI returned no response."),
+                                        )
                                     }
                                     busy = false
                                 }
@@ -255,28 +425,76 @@ class MainActivity : ComponentActivity() {
             Spacer(Modifier.height(8.dp))
             Text("AI DOWNLOADS REQUIRE YOUR CONFIRMATION IN SEAL  ·  IMPORTED CLIPS STAY ON DEVICE", color = Muted, fontSize = 9.sp, fontFamily = FontFamily.Monospace)
         }
+
+        if (showAiSettings) {
+            AlertDialog(
+                onDismissRequest = { showAiSettings = false },
+                title = { Text("BossAI endpoint") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(
+                            value = endpointInput,
+                            onValueChange = { endpointInput = it },
+                            label = { Text("HTTPS base URL") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                        )
+                        OutlinedTextField(value = modelInput, onValueChange = { modelInput = it }, label = { Text("Model") }, singleLine = true)
+                        OutlinedTextField(
+                            value = apiKeyInput,
+                            onValueChange = { apiKeyInput = it },
+                            label = { Text("API key") },
+                            singleLine = true,
+                            visualTransformation = PasswordVisualTransformation(),
+                        )
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        runCatching {
+                            AiSettingsStore.save(context, AiSettings(endpointInput, modelInput, apiKeyInput))
+                            aiSettings = AiSettingsStore.load(context)
+                            showAiSettings = false
+                        }.onFailure { Toast.makeText(context, it.message ?: "Invalid BossAI settings", Toast.LENGTH_LONG).show() }
+                    }) { Text("Save") }
+                },
+                dismissButton = { TextButton(onClick = { showAiSettings = false }) { Text("Cancel") } },
+                containerColor = Panel,
+                titleContentColor = Paper,
+                textContentColor = Paper,
+            )
+        }
     }
 
-    private suspend fun askBossAi(history: List<ChatMessage>): String {
-        require(BuildConfig.BOSSAI_BASE_URL.isNotBlank()) { "Set bossAiBaseUrl, bossAiModel and bossAiApiKey Gradle properties" }
-        require(BuildConfig.BOSSAI_MODEL.isNotBlank() && BuildConfig.BOSSAI_API_KEY.isNotBlank()) { "Set bossAiBaseUrl, bossAiModel and bossAiApiKey Gradle properties" }
-        val response = BossAiApi.create(BuildConfig.BOSSAI_BASE_URL).complete(
-            authorization = "Bearer ${BuildConfig.BOSSAI_API_KEY}",
+    private suspend fun askBossAi(settings: AiSettings, history: List<ChatMessage>): AssistantMessage {
+        require(settings.baseUrl.isNotBlank() && settings.model.isNotBlank() && settings.apiKey.isNotBlank()) {
+            "Open BossAI settings and enter an HTTPS base URL, model, and API key"
+        }
+        val response = BossAiApi.create(settings.baseUrl).complete(
+            authorization = "Bearer ${settings.apiKey}",
             request = ChatRequest(
-                model = BuildConfig.BOSSAI_MODEL,
+                model = settings.model,
                 messages = history,
-                tools = listOf(BossAiApi.downloadTool()),
+                tools = BossAiApi.editorTools(),
             ),
         )
-        val message = response.choices.firstOrNull()?.message ?: error("BossAI returned no response")
-        val downloadCall = message.toolCalls?.firstOrNull { it.function.name == "download_video" }
-        if (downloadCall != null) {
-            val url = JSONObject(downloadCall.function.arguments).optString("url")
-            val parsed = Uri.parse(url)
-            require(parsed.scheme in setOf("http", "https") && !parsed.host.isNullOrBlank()) { "BossAI returned an invalid video URL" }
-            return "SEAL_URL:$url"
+        return response.choices.firstOrNull()?.message ?: error("BossAI returned no response")
+    }
+
+    private fun outputSize(info: VideoInfo?, profile: String): Pair<Int, Int>? {
+        val video = info ?: return null
+        if (profile == "source") return null
+        val requestedLongEdge = when (profile) {
+            "1080p" -> 1920
+            "4k" -> 3840
+            else -> return null
         }
-        return message.content ?: "I couldn't form a response. Try asking in a different way."
+        val sourceLongEdge = maxOf(video.width, video.height)
+        val sourceShortEdge = minOf(video.width, video.height)
+        val requestedShortEdge = (requestedLongEdge.toDouble() * sourceShortEdge / sourceLongEdge)
+            .roundToInt().coerceAtLeast(2) / 2 * 2
+        return if (video.width >= video.height) requestedLongEdge to requestedShortEdge
+        else requestedShortEdge to requestedLongEdge
     }
 
     @Composable
@@ -306,20 +524,33 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun TimelineStrip(hasClip: Boolean) {
+    private fun TimelineStrip(
+        durationMs: Long,
+        trimRange: ClosedFloatingPointRange<Float>,
+        enabled: Boolean,
+        onTrimChange: (ClosedFloatingPointRange<Float>) -> Unit,
+    ) {
         Column(Modifier.fillMaxWidth().background(Panel, RoundedCornerShape(8.dp)).border(1.dp, Line, RoundedCornerShape(8.dp)).padding(10.dp)) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("00:00", color = Muted, fontSize = 9.sp, fontFamily = FontFamily.Monospace)
-                Text("TIMELINE", color = Acid, fontSize = 9.sp, fontFamily = FontFamily.Monospace)
-                Text("00:15", color = Muted, fontSize = 9.sp, fontFamily = FontFamily.Monospace)
+                Text(formatTime(trimRange.start.toLong()), color = Muted, fontSize = 9.sp, fontFamily = FontFamily.Monospace)
+                Text("TRIM RANGE", color = Acid, fontSize = 9.sp, fontFamily = FontFamily.Monospace)
+                Text(formatTime(trimRange.endInclusive.toLong()), color = Muted, fontSize = 9.sp, fontFamily = FontFamily.Monospace)
             }
             Spacer(Modifier.height(8.dp))
-            Box(Modifier.fillMaxWidth().height(34.dp).background(Color(0xFF252E28), RoundedCornerShape(4.dp))) {
-                if (hasClip) Box(Modifier.fillMaxWidth(0.72f).fillMaxSize().padding(2.dp).background(Color(0xFF627B4A), RoundedCornerShape(3.dp)))
-                Box(Modifier.width(2.dp).fillMaxSize().background(Acid))
-            }
+            RangeSlider(
+                value = trimRange,
+                onValueChange = onTrimChange,
+                valueRange = 0f..durationMs.coerceAtLeast(1L).toFloat(),
+                enabled = enabled,
+            )
         }
     }
+
+    private fun formatTime(timeMs: Long): String = "%02d:%02d.%1d".format(
+        timeMs / 60_000,
+        timeMs / 1_000 % 60,
+        timeMs / 100 % 10,
+    )
 
     @Composable
     private fun ActionButton(

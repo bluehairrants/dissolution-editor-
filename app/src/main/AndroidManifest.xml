@@ -3,6 +3,7 @@
 
     <queries>
         <package android:name="com.fadcam" />
+        <package android:name="com.junkfood.seal" />
     </queries>
 
     <application
